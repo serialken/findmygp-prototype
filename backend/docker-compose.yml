@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-logiconnect}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-logiconnect}
+      POSTGRES_DB: ${POSTGRES_DB:-logiconnect}
+    ports:
+      - "5432:5432"
+    volumes:
+      - logiconnect_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-logiconnect}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-logiconnect}:${POSTGRES_PASSWORD:-logiconnect}@db:5432/${POSTGRES_DB:-logiconnect}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  logiconnect_pgdata:

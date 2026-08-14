@@ -10,6 +10,13 @@ Thumbs.db
 node_modules/
 npm-debug.log*
 
+# Python / backend
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
 # Env
 .env
 .env.local
