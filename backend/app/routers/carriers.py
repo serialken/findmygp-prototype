@@ -5,7 +5,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import CarrierProfile
+from app.deps import get_current_user
+from app.models import CarrierProfile, User
 from app.schemas import CarrierOut
 
 router = APIRouter(prefix="/carriers", tags=["carriers"])
@@ -51,4 +52,35 @@ async def get_carrier(carrier_id: str, db: AsyncSession = Depends(get_db)):
     carrier = result.scalar_one_or_none()
     if not carrier:
         raise HTTPException(status_code=404, detail="Transporteur introuvable")
+    return carrier
+
+
+@router.post("/{carrier_id}/link-account", response_model=CarrierOut)
+async def link_carrier_account(
+    carrier_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Links the authenticated carrier-role account to one of the (currently
+    unclaimed, pre-seeded) carrier profiles, so that account can log tracking
+    updates and messages as that carrier. One profile <-> one account, strictly."""
+    if current_user.role.value != "carrier":
+        raise HTTPException(
+            status_code=403, detail="Seul un compte transporteur peut être lié à un profil transporteur"
+        )
+
+    result = await db.execute(select(CarrierProfile).where(CarrierProfile.id == carrier_id))
+    carrier = result.scalar_one_or_none()
+    if not carrier:
+        raise HTTPException(status_code=404, detail="Transporteur introuvable")
+
+    if carrier.user_id is not None and carrier.user_id != current_user.id:
+        raise HTTPException(status_code=409, detail="Ce profil transporteur est déjà lié à un autre compte")
+
+    if current_user.carrier_profile is not None and current_user.carrier_profile.id != carrier.id:
+        raise HTTPException(status_code=409, detail="Ce compte est déjà lié à un autre profil transporteur")
+
+    carrier.user_id = current_user.id
+    await db.commit()
+    await db.refresh(carrier)
     return carrier
