@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>LogiConnect — Mettez vos colis entre de bonnes mains</title>
-<meta name="description" content="Prototype cliquable — marketplace de mise en relation entre expéditeurs et transporteurs indépendants, pour l'envoi de colis en France et entre la France et le Sénégal." />
+<meta name="description" content="Marketplace de mise en relation entre expéditeurs et transporteurs indépendants, pour l'envoi de colis en France et entre la France et le Sénégal. Connectée à l'API LogiConnect." />
 
 <!-- Google Fonts (Inter) -->
 <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -51,6 +51,9 @@
 <!-- Babel Standalone: lets the browser compile JSX on the fly, no build step -->
 <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js" crossorigin></script>
 
+<!-- Stripe.js (only used once a real Stripe key is returned by the API) -->
+<script src="https://js.stripe.com/v3/"></script>
+
 <style>
   html { scroll-behavior: smooth; }
   body { font-family: 'Inter', ui-sans-serif, system-ui, sans-serif; background-color: #f6f7fb; }
@@ -92,12 +95,23 @@ function cx(...parts) {
 }
 
 function euros(amount) {
-  return amount.toLocaleString('fr-FR', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) + ' €';
+  const n = Number(amount) || 0;
+  return n.toLocaleString('fr-FR', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) + ' €';
+}
+
+// Backend timestamps are naive UTC ISO strings (no trailing "Z"). Treat any
+// ISO string without an explicit timezone designator as UTC before parsing,
+// otherwise the browser interprets it as local time and every timestamp
+// shown in the UI is off by the viewer's UTC offset.
+function parseUTC(iso) {
+  if (!iso) return null;
+  const hasTZ = /[zZ]|[+-]\d\d:\d\d$/.test(iso);
+  return new Date(hasTZ ? iso : iso + 'Z');
 }
 
 function formatDateTime(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
+  const d = parseUTC(iso);
+  if (!d) return '';
   return d.toLocaleDateString('fr-FR', { day: '2-digit', month: 'short' }) + ' à ' +
     d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
 }
@@ -121,50 +135,9 @@ function dayLabelFromDate(dateStr) {
   return days[d.getDay()];
 }
 
-function generateBookingRef() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  const now = new Date();
-  const mm = String(now.getMonth() + 1).padStart(2, '0');
-  return `LC-${now.getFullYear()}${mm}-${code}`;
-}
-
-function generateConfirmationCode() {
-  return String(Math.floor(1000 + Math.random() * 9000));
-}
-
-// Approximate real-world distances for known intercontinental pairs (km).
-// Domestic French routes keep using the pseudo-random estimate below —
-// only the Sénégal <-> France corridor needs a realistic anchor so pricing
-// doesn't look like a cheap domestic delivery.
-const KNOWN_DISTANCES_KM = {
-  'dakar|paris': 4200, 'paris|dakar': 4200,
-  'dakar|marseille': 4300, 'marseille|dakar': 4300,
-  'dakar|lyon': 4450, 'lyon|dakar': 4450,
-};
-
-function estimateDistanceKm(pickupCity, dropoffCity) {
-  if (!pickupCity || !dropoffCity) return 25;
-  const a = pickupCity.trim().toLowerCase();
-  const b = dropoffCity.trim().toLowerCase();
-  if (a === b) return 8;
-  const known = KNOWN_DISTANCES_KM[`${a}|${b}`];
-  if (known) return known;
-  let hash = 0;
-  const s = a + '|' + b;
-  for (let i = 0; i < s.length; i++) hash = (hash * 31 + s.charCodeAt(i)) >>> 0;
-  return 12 + (hash % 340);
-}
-
-function computePrice(carrier, distanceKm, fragile) {
-  let total = carrier.basePrice + carrier.pricePerKm * distanceKm;
-  if (fragile) total += 8;
-  return Math.round(total * 100) / 100;
-}
-
 /* ======================================================================
-   MOCK DATA
+   REFERENCE DATA (UI labels/icons only — real carrier/booking data now
+   comes from the API, see the API CLIENT section below)
    ====================================================================== */
 
 const VEHICLES = {
@@ -188,6 +161,9 @@ const PACKAGE_TYPES = {
 const TIME_WINDOWS = ['Matin', 'Après-midi', 'Soir'];
 const WEEK_DAYS = ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'];
 
+// The backend doesn't model customer reviews yet — these are deterministically
+// generated per carrier (seeded from the carrier's real id) purely for visual
+// filler on the profile page. Ratings/review counts themselves ARE real API data.
 const REVIEW_AUTHORS = ['Marie D.', 'Nicolas T.', 'Claire B.', 'Antoine R.', 'Léa M.', 'Pierre G.', 'Emma S.', 'Hugo L.', 'Chloé F.', 'Maxime P.', 'Julie N.', 'Romain C.'];
 
 const REVIEW_COMMENTS = [
@@ -223,158 +199,18 @@ function buildReviews(seed, count) {
   return reviews;
 }
 
-const RAW_CARRIERS = [
-  { id: 'c1', name: 'Julien Moreau', type: 'individuel', city: 'Paris', vehicle: 'scooter',
-    packageTypes: ['documents', 'petit_colis'], basePrice: 15, pricePerKm: 0.9,
-    zonesServed: ['Paris', 'Île-de-France', 'Versailles', 'Boulogne-Billancourt'],
-    rating: 4.8, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven'], timeWindows: ['Matin', 'Après-midi'],
-    responseTime: '< 1h', verified: true, completedDeliveries: 540, yearsActive: 3,
-    bio: "Coursier indépendant à Paris, spécialisé dans les livraisons express de documents et petits colis en scooter électrique." },
-
-  { id: 'c2', name: 'TransExpress Lyon', type: 'entreprise', city: 'Lyon', vehicle: 'camionnette',
-    packageTypes: ['petit_colis', 'colis_volumineux', 'fragile'], basePrice: 35, pricePerKm: 1.1,
-    zonesServed: ['Lyon', 'Villeurbanne', 'Saint-Étienne', 'Grenoble'],
-    rating: 4.6, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'], timeWindows: ['Matin', 'Après-midi', 'Soir'],
-    responseTime: '< 2h', verified: true, completedDeliveries: 1200, yearsActive: 6,
-    bio: "Société de transport régional basée à Lyon. Flotte de camionnettes équipées pour les colis volumineux et fragiles." },
-
-  { id: 'c3', name: 'Amélie Petit — Coursière Pro', type: 'individuel', city: 'Bordeaux', vehicle: 'velo',
-    packageTypes: ['documents', 'petit_colis'], basePrice: 10, pricePerKm: 0.7,
-    zonesServed: ['Bordeaux', 'Mérignac', 'Pessac'],
-    rating: 4.9, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven'], timeWindows: ['Matin', 'Après-midi'],
-    responseTime: '< 30 min', verified: true, completedDeliveries: 860, yearsActive: 4,
-    bio: "Livraison à vélo cargo, écoresponsable, dans le centre de Bordeaux et ses environs immédiats." },
-
-  { id: 'c4', name: 'Nord Fret Express', type: 'entreprise', city: 'Lille', vehicle: 'camion',
-    packageTypes: ['palette', 'colis_volumineux'], basePrice: 60, pricePerKm: 1.4,
-    zonesServed: ['Lille', 'Roubaix', 'Tourcoing', 'Dunkerque'],
-    rating: 4.4, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven'], timeWindows: ['Matin', 'Après-midi'],
-    responseTime: '< 4h', verified: true, completedDeliveries: 410, yearsActive: 9,
-    bio: "Spécialiste du transport de palettes et de marchandises volumineuses dans les Hauts-de-France." },
-
-  { id: 'c5', name: 'Sophie Lambert', type: 'individuel', city: 'Nantes', vehicle: 'voiture',
-    packageTypes: ['documents', 'petit_colis', 'fragile'], basePrice: 18, pricePerKm: 0.85,
-    zonesServed: ['Nantes', 'Saint-Nazaire', 'Rezé'],
-    rating: 4.7, availableDays: ['Mar', 'Mer', 'Jeu', 'Ven', 'Sam'], timeWindows: ['Après-midi', 'Soir'],
-    responseTime: '< 1h30', verified: false, completedDeliveries: 190, yearsActive: 2,
-    bio: "Transport soigné de colis fragiles et documents importants en voiture. Disponible en soirée pour les envois de dernière minute." },
-
-  { id: 'c6', name: "Rapid'Colis Marseille", type: 'entreprise', city: 'Marseille', vehicle: 'camionnette',
-    packageTypes: ['petit_colis', 'colis_volumineux'], basePrice: 28, pricePerKm: 1.0,
-    zonesServed: ['Marseille', 'Aix-en-Provence', 'Aubagne'],
-    rating: 4.3, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'], timeWindows: ['Matin', 'Après-midi'],
-    responseTime: '< 2h', verified: true, completedDeliveries: 980, yearsActive: 5,
-    bio: "Livraisons rapides sur toute l'agglomération marseillaise, du colis simple au volumineux." },
-
-  { id: 'c7', name: 'Karim Belkacem', type: 'individuel', city: 'Toulouse', vehicle: 'scooter',
-    packageTypes: ['documents', 'petit_colis'], basePrice: 12, pricePerKm: 0.8,
-    zonesServed: ['Toulouse', 'Blagnac', 'Colomiers'],
-    rating: 4.5, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven'], timeWindows: ['Matin', 'Après-midi', 'Soir'],
-    responseTime: '< 1h', verified: true, completedDeliveries: 320, yearsActive: 2,
-    bio: "Coursier scooter réactif, spécialiste des livraisons urgentes dans l'agglomération toulousaine." },
-
-  { id: 'c8', name: 'Océane Fournier', type: 'individuel', city: 'Rennes', vehicle: 'voiture',
-    packageTypes: ['petit_colis', 'fragile', 'documents'], basePrice: 16, pricePerKm: 0.9,
-    zonesServed: ['Rennes', 'Saint-Malo', 'Vitré'],
-    rating: 4.9, availableDays: ['Lun', 'Mer', 'Jeu', 'Ven'], timeWindows: ['Matin', 'Après-midi'],
-    responseTime: '< 1h', verified: true, completedDeliveries: 410, yearsActive: 3,
-    bio: "Livraison soignée et ponctuelle en Bretagne, expérience particulière avec les objets fragiles et précieux." },
-
-  { id: 'c9', name: 'Alpine Logistique', type: 'entreprise', city: 'Grenoble', vehicle: 'camion',
-    packageTypes: ['palette', 'colis_volumineux', 'fragile'], basePrice: 55, pricePerKm: 1.3,
-    zonesServed: ['Grenoble', 'Chambéry', 'Annecy'],
-    rating: 4.2, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven'], timeWindows: ['Matin', 'Après-midi'],
-    responseTime: '< 3h', verified: true, completedDeliveries: 275, yearsActive: 7,
-    bio: "Transport de marchandises en zone alpine, y compris trajets en altitude et conditions hivernales." },
-
-  { id: 'c10', name: 'Camille Girard', type: 'individuel', city: 'Strasbourg', vehicle: 'velo',
-    packageTypes: ['documents', 'petit_colis'], basePrice: 9, pricePerKm: 0.65,
-    zonesServed: ['Strasbourg', 'Schiltigheim', 'Illkirch-Graffenstaden'],
-    rating: 4.8, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'], timeWindows: ['Matin', 'Après-midi'],
-    responseTime: '< 45 min', verified: true, completedDeliveries: 702, yearsActive: 4,
-    bio: "Coursière à vélo cargo, livraisons rapides et écologiques dans l'Eurométropole de Strasbourg." },
-
-  { id: 'c11', name: 'Sud Transport Express', type: 'entreprise', city: 'Montpellier', vehicle: 'camionnette',
-    packageTypes: ['petit_colis', 'colis_volumineux', 'palette'], basePrice: 32, pricePerKm: 1.05,
-    zonesServed: ['Montpellier', 'Nîmes', 'Sète'],
-    rating: 4.5, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven'], timeWindows: ['Matin', 'Après-midi', 'Soir'],
-    responseTime: '< 2h', verified: true, completedDeliveries: 650, yearsActive: 5,
-    bio: "Transporteur régional couvrant l'Hérault et le Gard, du colis unique aux tournées régulières." },
-
-  { id: 'c12', name: 'Thomas Bernard', type: 'individuel', city: 'Nice', vehicle: 'voiture',
-    packageTypes: ['documents', 'petit_colis', 'fragile'], basePrice: 20, pricePerKm: 0.95,
-    zonesServed: ['Nice', 'Cannes', 'Antibes'],
-    rating: 4.6, availableDays: ['Mar', 'Mer', 'Jeu', 'Ven', 'Sam'], timeWindows: ['Après-midi', 'Soir'],
-    responseTime: '< 1h30', verified: false, completedDeliveries: 230, yearsActive: 2,
-    bio: "Livraisons sur la Côte d'Azur, spécialiste des trajets combinant clientèle touristique et professionnelle." },
-
-  { id: 'c13', name: 'France Colis National', type: 'entreprise', city: 'Paris', vehicle: 'camion',
-    packageTypes: ['petit_colis', 'colis_volumineux', 'palette', 'fragile'], basePrice: 45, pricePerKm: 1.2,
-    zonesServed: ['Paris', 'Lyon', 'Marseille', 'Toulouse', 'Nantes', 'Strasbourg', 'Montpellier', 'Bordeaux', 'Lille', 'Rennes', 'Grenoble', 'Nice'],
-    rating: 4.4, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven'], timeWindows: ['Matin', 'Après-midi'],
-    responseTime: '< 3h', verified: true, completedDeliveries: 2100, yearsActive: 11,
-    bio: "Réseau national de transport interurbain. Liaisons régulières entre les grandes métropoles françaises, tous types de colis." },
-
-  { id: 'c14', name: 'RoutePartner Colis', type: 'entreprise', city: 'Lyon', vehicle: 'camionnette',
-    packageTypes: ['documents', 'petit_colis', 'colis_volumineux'], basePrice: 38, pricePerKm: 1.0,
-    zonesServed: ['Lyon', 'Paris', 'Marseille', 'Toulouse', 'Bordeaux', 'Nantes', 'Strasbourg', 'Lille', 'Montpellier'],
-    rating: 4.5, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'], timeWindows: ['Matin', 'Après-midi', 'Soir'],
-    responseTime: '< 2h', verified: true, completedDeliveries: 1450, yearsActive: 8,
-    bio: "Transporteur interurbain basé à Lyon, liaisons quotidiennes vers les principales villes de France." },
-
-  { id: 'c15', name: 'Téranga Air Cargo', type: 'entreprise', city: 'Dakar', vehicle: 'avion',
-    packageTypes: ['documents', 'petit_colis', 'colis_volumineux', 'fragile'], basePrice: 35, pricePerKm: 0.02,
-    zonesServed: ['Dakar', 'Paris', 'Marseille', 'Lyon'],
-    rating: 4.6, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven'], timeWindows: ['Matin', 'Après-midi'],
-    responseTime: '< 4h', verified: true, completedDeliveries: 890, yearsActive: 6,
-    deliveryEstimate: '3 à 5 jours ouvrés',
-    bio: "Spécialiste du fret aérien entre Dakar et la France (Paris, Marseille, Lyon). Dédouanement inclus, livraison en 3 à 5 jours ouvrés." },
-
-  { id: 'c16', name: 'Sénégal Maritime Groupage', type: 'entreprise', city: 'Dakar', vehicle: 'bateau',
-    packageTypes: ['petit_colis', 'colis_volumineux', 'palette'], basePrice: 20, pricePerKm: 0.01,
-    zonesServed: ['Dakar', 'Paris', 'Marseille'],
-    rating: 4.4, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven'], timeWindows: ['Matin'],
-    responseTime: '< 6h', verified: true, completedDeliveries: 540, yearsActive: 9,
-    deliveryEstimate: '3 à 5 semaines',
-    bio: "Transport maritime groupé (conteneur) entre le port de Dakar et les ports français. Solution économique pour colis volumineux et palettes, délai de 3 à 5 semaines." },
-
-  { id: 'c17', name: 'Moussa Diop', type: 'individuel', city: 'Dakar', vehicle: 'scooter',
-    packageTypes: ['documents', 'petit_colis'], basePrice: 3, pricePerKm: 0.3,
-    zonesServed: ['Dakar', 'Pikine', 'Guédiawaye', 'Parcelles Assainies', 'Rufisque'],
-    rating: 4.7, availableDays: ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'], timeWindows: ['Matin', 'Après-midi', 'Soir'],
-    responseTime: '< 30 min', verified: true, completedDeliveries: 610, yearsActive: 4,
-    bio: "Coursier indépendant basé à Dakar, livraisons rapides en scooter dans l'agglomération dakaroise (Plateau, Pikine, Parcelles Assainies, Guédiawaye, Rufisque)." },
-];
-
-const CARRIERS = RAW_CARRIERS.map((c, idx) => ({
-  ...c,
-  initials: c.name.split(' ').filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase(),
-  reviews: buildReviews(idx + 1, 3),
-}));
-
-// Derive a plausible "total reviews" figure from delivery volume (kept separate from the 2-3 sample reviews shown on the profile)
-CARRIERS.forEach(c => { c.reviewCountDisplay = Math.round(40 + (c.completedDeliveries / 6)); });
-
-const CITY_LIST = Array.from(new Set(CARRIERS.flatMap(c => [c.city, ...c.zonesServed]))).sort();
-
-const STATUS_ORDER = ['booked', 'picked_up', 'in_transit', 'delivered'];
-const STATUS_LABELS = { booked: 'Réservé', picked_up: 'Récupéré', in_transit: 'En transit', delivered: 'Livré' };
-const STATUS_ICONS = { booked: '🗓️', picked_up: '📤', in_transit: '🚚', delivered: '📬' };
+const STATUS_ORDER = ['pending', 'confirmed', 'picked_up', 'in_transit', 'delivered'];
+const STATUS_LABELS = { pending: 'En attente', confirmed: 'Confirmé', picked_up: 'Récupéré', in_transit: 'En transit', delivered: 'Livré', cancelled: 'Annulé' };
+const STATUS_ICONS = { pending: '🗓️', confirmed: '✅', picked_up: '📤', in_transit: '🚚', delivered: '📬', cancelled: '✕' };
 const STATUS_BADGE_CLASSES = {
-  booked: 'bg-slate-100 text-slate-700',
+  pending: 'bg-slate-100 text-slate-700',
+  confirmed: 'bg-blue-100 text-blue-800',
   picked_up: 'bg-amber-100 text-amber-800',
   in_transit: 'bg-brand-100 text-brand-800',
   delivered: 'bg-emerald-100 text-emerald-800',
+  cancelled: 'bg-rose-100 text-rose-800',
 };
-
-const CARRIER_REPLIES = [
-  "Bonjour, merci pour votre message ! Je m'en occupe et reviens vers vous rapidement.",
-  "C'est noté, je confirme la prise en charge à l'horaire indiqué.",
-  "Parfait, aucun souci de mon côté. À très vite !",
-  "Merci pour ces précisions, tout est clair pour la livraison.",
-  "Je vous tiens informé(e) dès que le colis est récupéré.",
-  "Entendu, je vous envoie une photo dès la remise effectuée.",
-];
+const PAYMENT_STATUS_LABELS = { unpaid: 'Non payé', processing: 'Paiement en cours', paid: 'Payé', failed: 'Échec du paiement', refunded: 'Remboursé' };
 
 /* ======================================================================
    HASH ROUTER (no router library — plain window.location.hash)
@@ -394,103 +230,217 @@ function buildHash(screen, params) {
 }
 
 /* ======================================================================
-   APP STATE (in-memory only — resets on page reload)
+   API CLIENT
    ====================================================================== */
 
-const AppContext = createContext(null);
-function useApp() { return useContext(AppContext); }
+// Backend API base URL. Change this when deploying (e.g. to your API's
+// production URL) — everything else in this file reads from this constant.
+const API_BASE = 'http://localhost:8001';
+const WS_BASE = API_BASE.replace(/^http/, 'ws');
 
-function AppProvider({ children }) {
-  const [bookings, setBookings] = useState([]);
-  const [threads, setThreads] = useState({
-    c1: [
-      { id: 'm1', sender: 'carrier', text: "Bonjour ! Je suis disponible cette semaine pour vos livraisons sur Paris et l'Île-de-France.", time: new Date(Date.now() - 1000 * 60 * 60 * 26).toISOString() },
-      { id: 'm2', sender: 'client', text: "Bonjour Julien, super, je reviens vers vous bientôt avec les détails.", time: new Date(Date.now() - 1000 * 60 * 60 * 25).toISOString() },
-    ],
-    c2: [
-      { id: 'm3', sender: 'carrier', text: "Bonjour, merci pour votre demande. Quel est le gabarit approximatif du colis ?", time: new Date(Date.now() - 1000 * 60 * 60 * 4).toISOString() },
-    ],
-  });
-  const [typingCarrierId, setTypingCarrierId] = useState(null);
+class ApiError extends Error {
+  constructor(message, status, body) {
+    super(message);
+    this.status = status;
+    this.body = body;
+  }
+}
 
-  function getCarrier(id) {
-    return CARRIERS.find(c => c.id === id) || null;
+async function apiFetch(path, { method = 'GET', body, token } = {}) {
+  const headers = {};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  let res;
+  try {
+    res = await fetch(API_BASE + path, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (networkErr) {
+    throw new ApiError("Impossible de contacter le serveur LogiConnect. Vérifiez qu'il est démarré et réessayez.", 0, null);
   }
 
-  function sendMessage(carrierId, text, sender = 'client') {
-    const msg = { id: 'm' + Date.now() + Math.random().toString(16).slice(2), sender, text, time: new Date().toISOString() };
-    setThreads(prev => ({ ...prev, [carrierId]: [...(prev[carrierId] || []), msg] }));
-    return msg;
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch (e) { data = null; }
   }
 
-  function simulateCarrierReply(carrierId, delay = 1400) {
-    setTypingCarrierId(carrierId);
-    setTimeout(() => {
-      const reply = CARRIER_REPLIES[Math.floor(Math.random() * CARRIER_REPLIES.length)];
-      sendMessage(carrierId, reply, 'carrier');
-      setTypingCarrierId(null);
-    }, delay);
+  if (!res.ok) {
+    const message = (data && typeof data.detail === 'string') ? data.detail : `Erreur ${res.status}`;
+    throw new ApiError(message, res.status, data);
+  }
+  return data;
+}
+
+function hashSeed(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) hash = (hash * 31 + str.charCodeAt(i)) >>> 0;
+  return (hash % 997) + 1;
+}
+
+// Normalizes the API's snake_case carrier payload into the camelCase shape
+// the UI components use, and attaches presentational-only fields (initials,
+// cosmetic reviews) that have no backend equivalent.
+function normalizeCarrier(c) {
+  const initials = c.name.split(' ').filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase();
+  return {
+    ...c,
+    packageTypes: c.package_types,
+    zonesServed: c.zones_served,
+    basePrice: c.base_price,
+    pricePerKm: c.price_per_km,
+    availableDays: c.available_days,
+    timeWindows: c.time_windows,
+    responseTime: c.response_time,
+    completedDeliveries: c.completed_deliveries,
+    yearsActive: c.years_active,
+    reviewCountDisplay: c.review_count,
+    deliveryEstimate: c.delivery_estimate,
+    initials,
+    reviews: buildReviews(hashSeed(c.id), 3),
+  };
+}
+
+function normalizeBooking(b) {
+  return {
+    ...b,
+    carrierId: b.carrier_id,
+    pickup: { address: b.pickup_address, city: b.pickup_city, postalCode: b.pickup_postal_code || '' },
+    dropoff: { address: b.dropoff_address, city: b.dropoff_city, postalCode: b.dropoff_postal_code || '' },
+    packageType: b.package_type,
+    weight: b.weight_kg,
+    date: b.requested_date,
+    timeWindow: b.time_window,
+    distanceKm: b.distance_km,
+    confirmationCode: b.confirmation_code,
+    createdAt: b.created_at,
+    paymentStatus: b.payment_status,
+    externalTrackingNumber: b.external_tracking_number,
+  };
+}
+
+/* ======================================================================
+   AUTH
+   ====================================================================== */
+
+const AuthContext = createContext(null);
+function useAuth() { return useContext(AuthContext); }
+
+function AuthProvider({ children }) {
+  const [token, setToken] = useState(() => localStorage.getItem('lc_access_token'));
+  const [refreshToken, setRefreshToken] = useState(() => localStorage.getItem('lc_refresh_token'));
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!token) { setAuthLoading(false); return; }
+    apiFetch('/auth/me', { token })
+      .then(u => { if (!cancelled) setUser(u); })
+      .catch(() => { if (!cancelled) clearAuth(); })
+      .finally(() => { if (!cancelled) setAuthLoading(false); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, []);
+
+  function persist(data) {
+    setToken(data.access_token);
+    setRefreshToken(data.refresh_token);
+    setUser(data.user);
+    localStorage.setItem('lc_access_token', data.access_token);
+    localStorage.setItem('lc_refresh_token', data.refresh_token);
   }
 
-  function createBooking(carrierId, data) {
-    const carrier = getCarrier(carrierId);
-    const distanceKm = estimateDistanceKm(data.pickup.city, data.dropoff.city);
-    const price = computePrice(carrier, distanceKm, data.fragile);
-    const now = new Date().toISOString();
-    const booking = {
-      id: 'bk_' + Date.now(),
-      ref: generateBookingRef(),
-      carrierId,
-      pickup: data.pickup,
-      dropoff: data.dropoff,
-      packageType: data.packageType,
-      weight: data.weight,
-      dimensions: data.dimensions,
-      fragile: data.fragile,
-      description: data.description,
-      date: data.date,
-      timeWindow: data.timeWindow,
-      distanceKm,
-      price,
-      status: 'booked',
-      confirmationCode: generateConfirmationCode(),
-      createdAt: now,
-      statusHistory: [{ status: 'booked', at: now }],
-    };
-    setBookings(prev => [booking, ...prev]);
-
-    // Bridge into messaging: notify the carrier automatically
-    const summary = `Bonjour, je viens de réserver une livraison avec vous (réf. ${booking.ref}) — de ${data.pickup.city} à ${data.dropoff.city}, le ${formatDateLong(data.date)} (${data.timeWindow}). Merci de me confirmer !`;
-    sendMessage(carrierId, summary, 'client');
-    simulateCarrierReply(carrierId, 1600);
-
-    return booking;
+  function clearAuth() {
+    setToken(null);
+    setRefreshToken(null);
+    setUser(null);
+    localStorage.removeItem('lc_access_token');
+    localStorage.removeItem('lc_refresh_token');
   }
 
-  function advanceBookingStatus(bookingId) {
-    setBookings(prev => prev.map(b => {
-      if (b.id !== bookingId) return b;
-      const idx = STATUS_ORDER.indexOf(b.status);
-      if (idx >= STATUS_ORDER.length - 1) return b;
-      const nextStatus = STATUS_ORDER[idx + 1];
-      const now = new Date().toISOString();
-      return { ...b, status: nextStatus, statusHistory: [...b.statusHistory, { status: nextStatus, at: now }] };
-    }));
+  async function login(email, password) {
+    const data = await apiFetch('/auth/login', { method: 'POST', body: { email, password } });
+    persist(data);
+    return data;
+  }
+
+  async function register(email, password, fullName) {
+    const data = await apiFetch('/auth/register', { method: 'POST', body: { email, password, full_name: fullName, role: 'client' } });
+    persist(data);
+    return data;
+  }
+
+  function logout() {
+    clearAuth();
+  }
+
+  // Wraps apiFetch with the current token, and transparently retries once
+  // via /auth/refresh on a 401 (access tokens expire after 30 min — this is
+  // the difference between "session dies annoyingly mid-use" and not).
+  async function authedFetch(path, opts = {}) {
+    try {
+      return await apiFetch(path, { ...opts, token });
+    } catch (err) {
+      if (err.status === 401 && refreshToken) {
+        try {
+          const data = await apiFetch('/auth/refresh', { method: 'POST', body: { refresh_token: refreshToken } });
+          persist(data);
+          return await apiFetch(path, { ...opts, token: data.access_token });
+        } catch (refreshErr) {
+          clearAuth();
+          throw err;
+        }
+      }
+      if (err.status === 401) clearAuth();
+      throw err;
+    }
   }
 
   const value = {
-    carriers: CARRIERS,
-    getCarrier,
-    bookings,
-    createBooking,
-    advanceBookingStatus,
-    threads,
-    sendMessage,
-    simulateCarrierReply,
-    typingCarrierId,
+    token, user, authLoading, isAuthenticated: !!token,
+    login, register, logout, authedFetch,
   };
 
-  return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+/* ======================================================================
+   SHARED DATA (all carriers, fetched once — used for the city autocomplete
+   list, the homepage's top-rated section, and as a lookup cache elsewhere
+   so pages don't have to refetch a carrier they already know the id of)
+   ====================================================================== */
+
+const DataContext = createContext(null);
+function useData() { return useContext(DataContext); }
+
+function DataProvider({ children }) {
+  const [allCarriers, setAllCarriers] = useState([]);
+  const [carriersLoading, setCarriersLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch('/carriers')
+      .then(list => { if (!cancelled) setAllCarriers(list.map(normalizeCarrier)); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setCarriersLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const cityList = useMemo(
+    () => Array.from(new Set(allCarriers.flatMap(c => [c.city, ...c.zonesServed]))).sort(),
+    [allCarriers]
+  );
+
+  function getCarrierFromCache(id) {
+    return allCarriers.find(c => c.id === id) || null;
+  }
+
+  const value = { allCarriers, cityList, carriersLoading, getCarrierFromCache };
+  return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
 }
 
 /* ======================================================================
@@ -599,15 +549,44 @@ function Field({ label, children, hint }) {
 
 const inputClass = 'w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 shadow-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100';
 
+function Spinner({ label }) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-3 py-14 text-slate-400">
+      <div className="h-8 w-8 animate-spin rounded-full border-2 border-slate-200 border-t-brand-600"></div>
+      {label && <p className="text-sm">{label}</p>}
+    </div>
+  );
+}
+
+function ErrorBanner({ message, onRetry }) {
+  if (!message) return null;
+  return (
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-rose-50 p-4 text-sm text-rose-700">
+      <span>⚠️ {message}</span>
+      {onRetry && <button onClick={onRetry} className="font-semibold underline">Réessayer</button>}
+    </div>
+  );
+}
+
 /* ======================================================================
    NAV BAR
    ====================================================================== */
 
 function NavBar() {
   const { navigate, nav } = useApp2();
-  const { bookings } = useApp();
+  const { user, isAuthenticated, authedFetch, logout } = useAuth();
+  const [activeCount, setActiveCount] = useState(0);
   const [open, setOpen] = useState(false);
-  const activeBookings = bookings.filter(b => b.status !== 'delivered').length;
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!isAuthenticated) { setActiveCount(0); return; }
+    authedFetch('/bookings/mine')
+      .then(list => { if (!cancelled) setActiveCount(list.filter(b => b.status !== 'delivered' && b.status !== 'cancelled').length); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, [isAuthenticated, nav.screen]);
 
   const links = [
     { screen: 'home', label: 'Accueil' },
@@ -615,6 +594,11 @@ function NavBar() {
     { screen: 'dashboard', label: 'Tableau de bord' },
     { screen: 'messaging', label: 'Messages' },
   ];
+
+  function handleLogout() {
+    logout();
+    navigate('home');
+  }
 
   return (
     <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/90 backdrop-blur">
@@ -630,16 +614,24 @@ function NavBar() {
               className={cx('relative rounded-lg px-4 py-2 text-sm font-semibold transition',
                 nav.screen === l.screen ? 'bg-brand-50 text-brand-700' : 'text-slate-600 hover:bg-slate-100')}>
               {l.label}
-              {l.screen === 'dashboard' && activeBookings > 0 && (
+              {l.screen === 'dashboard' && activeCount > 0 && (
                 <span className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-rose-500 text-[10px] font-bold text-white">
-                  {activeBookings}
+                  {activeCount}
                 </span>
               )}
             </button>
           ))}
         </nav>
 
-        <div className="hidden md:block">
+        <div className="hidden items-center gap-3 md:flex">
+          {isAuthenticated ? (
+            <>
+              <span className="text-sm text-slate-500">Bonjour, <strong className="text-slate-700">{user ? user.full_name.split(' ')[0] : '…'}</strong></span>
+              <SecondaryButton onClick={handleLogout} className="!px-4 !py-2">Déconnexion</SecondaryButton>
+            </>
+          ) : (
+            <SecondaryButton onClick={() => navigate('login')} className="!px-4 !py-2">Connexion</SecondaryButton>
+          )}
           <PrimaryButton onClick={() => navigate('search')} className="!px-4 !py-2">Trouver un transporteur</PrimaryButton>
         </div>
 
@@ -656,11 +648,18 @@ function NavBar() {
                 className={cx('rounded-lg px-3 py-2.5 text-left text-sm font-semibold',
                   nav.screen === l.screen ? 'bg-brand-50 text-brand-700' : 'text-slate-600 hover:bg-slate-100')}>
                 {l.label}
-                {l.screen === 'dashboard' && activeBookings > 0 && (
-                  <span className="ml-2 rounded-full bg-rose-500 px-1.5 py-0.5 text-[10px] font-bold text-white">{activeBookings}</span>
+                {l.screen === 'dashboard' && activeCount > 0 && (
+                  <span className="ml-2 rounded-full bg-rose-500 px-1.5 py-0.5 text-[10px] font-bold text-white">{activeCount}</span>
                 )}
               </button>
             ))}
+            <div className="mt-2 border-t border-slate-100 pt-2">
+              {isAuthenticated ? (
+                <button onClick={() => { handleLogout(); setOpen(false); }} className="w-full rounded-lg px-3 py-2.5 text-left text-sm font-semibold text-slate-600 hover:bg-slate-100">Déconnexion ({user ? user.full_name : ''})</button>
+              ) : (
+                <button onClick={() => { navigate('login'); setOpen(false); }} className="w-full rounded-lg px-3 py-2.5 text-left text-sm font-semibold text-slate-600 hover:bg-slate-100">Connexion</button>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -678,7 +677,7 @@ function Footer() {
             LogiConnect
           </div>
           <p className="max-w-xl text-xs leading-relaxed text-slate-400">
-            Ceci est un prototype de démonstration UX. Toutes les données (transporteurs, avis, réservations, messages, statuts de livraison) sont fictives et générées localement — aucune information n'est envoyée à un serveur.
+            Connecté à l'API LogiConnect ({API_BASE}). Paiement en mode test Stripe, suivi transporteur simulé (Chronopost/Colissimo/DHL) tant qu'aucune clé API réelle n'est configurée côté serveur.
           </p>
         </div>
       </div>
@@ -711,9 +710,6 @@ function SearchBar({ compact, initial, onSearch }) {
       <Field label="Date souhaitée">
         <input type="date" min={todayISO()} className={inputClass} value={date} onChange={e => setDate(e.target.value)} />
       </Field>
-      <datalist id="city-list">
-        {CITY_LIST.map(c => <option key={c} value={c} />)}
-      </datalist>
       <div className={cx('flex items-end', compact ? '' : 'sm:col-span-3')}>
         <PrimaryButton type="submit" className="w-full">
           🔍 Rechercher un transporteur
@@ -725,8 +721,8 @@ function SearchBar({ compact, initial, onSearch }) {
 
 function HomePage() {
   const { navigate } = useApp2();
-  const { carriers } = useApp();
-  const top = [...carriers].sort((a, b) => b.rating - a.rating).slice(0, 4);
+  const { allCarriers, carriersLoading } = useData();
+  const top = [...allCarriers].sort((a, b) => b.rating - a.rating).slice(0, 4);
 
   return (
     <div>
@@ -795,9 +791,11 @@ function HomePage() {
               Voir tous les transporteurs →
             </button>
           </div>
-          <div className="mt-8 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
-            {top.map(c => <CarrierCard key={c.id} carrier={c} />)}
-          </div>
+          {carriersLoading ? <Spinner label="Chargement des transporteurs…" /> : (
+            <div className="mt-8 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
+              {top.map(c => <CarrierCard key={c.id} carrier={c} />)}
+            </div>
+          )}
           <div className="mt-8 text-center sm:hidden">
             <SecondaryButton onClick={() => navigate('search')}>Voir tous les transporteurs</SecondaryButton>
           </div>
@@ -813,7 +811,6 @@ function HomePage() {
 
 function CarrierCard({ carrier }) {
   const { navigate } = useApp2();
-  const v = VEHICLES[carrier.vehicle];
   return (
     <button onClick={() => navigate('carrier', { id: carrier.id })}
       className="group flex flex-col rounded-2xl border border-slate-200 bg-white p-5 text-left shadow-card transition hover:-translate-y-0.5 hover:shadow-cardHover">
@@ -930,24 +927,16 @@ function FilterPanel({ filters, setFilters }) {
   );
 }
 
-function filterCarriers(carriers, filters) {
+// pickup/dropoff city, vehicle and max price are sent to the API as query
+// params (server-side filtering). packageTypes (multi-select), date/day-of-
+// week availability, and timeWindow aren't modeled as query params on the
+// backend, so they're refined here client-side over the already-narrowed result set.
+function applyClientSideFilters(carriers, filters) {
   return carriers.filter(c => {
-    if (filters.pickupCity) {
-      const q = filters.pickupCity.toLowerCase();
-      const ok = c.city.toLowerCase().includes(q) || c.zonesServed.some(z => z.toLowerCase().includes(q));
-      if (!ok) return false;
-    }
-    if (filters.dropoffCity) {
-      const q = filters.dropoffCity.toLowerCase();
-      const ok = c.city.toLowerCase().includes(q) || c.zonesServed.some(z => z.toLowerCase().includes(q));
-      if (!ok) return false;
-    }
     if (filters.packageTypes.length > 0) {
       const ok = filters.packageTypes.some(pt => c.packageTypes.includes(pt));
       if (!ok) return false;
     }
-    if (filters.vehicle !== 'all' && c.vehicle !== filters.vehicle) return false;
-    if (c.basePrice > filters.maxPrice) return false;
     if (filters.date) {
       const day = dayLabelFromDate(filters.date);
       if (day && !c.availableDays.includes(day)) return false;
@@ -958,8 +947,6 @@ function filterCarriers(carriers, filters) {
 }
 
 function SearchPage({ params }) {
-  const { carriers } = useApp();
-  const { navigate } = useApp2();
   const [filters, setFilters] = useState({
     pickupCity: params.pickupCity || '',
     dropoffCity: params.dropoffCity || '',
@@ -971,15 +958,37 @@ function SearchPage({ params }) {
   });
   const [sort, setSort] = useState('rating_desc');
   const [showFilters, setShowFilters] = useState(false);
+  const [serverResults, setServerResults] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      setLoading(true);
+      setError('');
+      const qs = new URLSearchParams();
+      if (filters.pickupCity) qs.set('pickup_city', filters.pickupCity);
+      if (filters.dropoffCity) qs.set('dropoff_city', filters.dropoffCity);
+      if (filters.vehicle !== 'all') qs.set('vehicle', filters.vehicle);
+      qs.set('max_price', String(filters.maxPrice));
+      apiFetch(`/carriers?${qs.toString()}`)
+        .then(list => { if (!cancelled) setServerResults(list.map(normalizeCarrier)); })
+        .catch(err => { if (!cancelled) setError(err.message); })
+        .finally(() => { if (!cancelled) setLoading(false); });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [filters.pickupCity, filters.dropoffCity, filters.vehicle, filters.maxPrice]);
 
   const results = useMemo(() => {
-    const list = filterCarriers(carriers, filters);
+    const list = applyClientSideFilters(serverResults, filters);
     const sorted = [...list];
     if (sort === 'rating_desc') sorted.sort((a, b) => b.rating - a.rating);
     if (sort === 'price_asc') sorted.sort((a, b) => a.basePrice - b.basePrice);
     if (sort === 'price_desc') sorted.sort((a, b) => b.basePrice - a.basePrice);
     return sorted;
-  }, [carriers, filters, sort]);
+    // eslint-disable-next-line
+  }, [serverResults, filters.packageTypes, filters.date, filters.timeWindow, sort]);
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
@@ -1005,7 +1014,7 @@ function SearchPage({ params }) {
 
         <div>
           <div className="mb-4 flex items-center justify-between">
-            <p className="text-sm text-slate-500">{results.length} transporteur{results.length !== 1 ? 's' : ''} trouvé{results.length !== 1 ? 's' : ''}</p>
+            <p className="text-sm text-slate-500">{loading ? 'Recherche…' : `${results.length} transporteur${results.length !== 1 ? 's' : ''} trouvé${results.length !== 1 ? 's' : ''}`}</p>
             <select className={cx(inputClass, 'w-auto')} value={sort} onChange={e => setSort(e.target.value)}>
               <option value="rating_desc">Mieux notés</option>
               <option value="price_asc">Prix croissant</option>
@@ -1013,7 +1022,9 @@ function SearchPage({ params }) {
             </select>
           </div>
 
-          {results.length === 0 ? (
+          <ErrorBanner message={error} />
+
+          {loading ? <Spinner label="Recherche des transporteurs…" /> : results.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-12 text-center">
               <div className="text-4xl">🔍</div>
               <h3 className="mt-3 text-base font-bold text-slate-800">Aucun transporteur ne correspond à vos critères</h3>
@@ -1068,14 +1079,30 @@ function AvailabilityGrid({ carrier }) {
 }
 
 function CarrierDetailPage({ params }) {
-  const { getCarrier } = useApp();
   const { navigate } = useApp2();
-  const carrier = getCarrier(params.id);
+  const { getCarrierFromCache } = useData();
+  const [carrier, setCarrier] = useState(() => getCarrierFromCache(params.id));
+  const [loading, setLoading] = useState(!carrier);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError('');
+    apiFetch(`/carriers/${params.id}`)
+      .then(c => { if (!cancelled) setCarrier(normalizeCarrier(c)); })
+      .catch(err => { if (!cancelled) setError(err.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, [params.id]);
+
+  if (loading && !carrier) return <Spinner label="Chargement du profil…" />;
 
   if (!carrier) {
     return (
       <div className="mx-auto max-w-2xl px-4 py-20 text-center">
-        <p className="text-lg font-semibold text-slate-700">Transporteur introuvable.</p>
+        <p className="text-lg font-semibold text-slate-700">{error || 'Transporteur introuvable.'}</p>
         <SecondaryButton className="mt-4" onClick={() => navigate('search')}>Retour à la recherche</SecondaryButton>
       </div>
     );
@@ -1163,7 +1190,7 @@ function CarrierDetailPage({ params }) {
                 </tr>
               </tbody>
             </table>
-            <p className="mt-3 text-xs text-slate-400">Le prix final est estimé automatiquement lors de la réservation, en fonction de la distance entre les adresses.</p>
+            <p className="mt-3 text-xs text-slate-400">Le prix final est calculé par le serveur lors de la réservation, en fonction de la distance réelle entre les adresses.</p>
           </Section>
 
           <Section title="Sécurité & confiance">
@@ -1174,6 +1201,97 @@ function CarrierDetailPage({ params }) {
             </ul>
           </Section>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ======================================================================
+   AUTH GUARD
+   ====================================================================== */
+
+function useRequireAuth(nextScreen, nextParams) {
+  const { isAuthenticated, authLoading } = useAuth();
+  const { navigate } = useApp2();
+  useEffect(() => {
+    if (!authLoading && !isAuthenticated) {
+      navigate('login', { next: nextScreen, ...nextParams });
+    }
+    // eslint-disable-next-line
+  }, [authLoading, isAuthenticated]);
+  return { isAuthenticated, authLoading };
+}
+
+/* ======================================================================
+   LOGIN / REGISTER PAGE
+   ====================================================================== */
+
+function LoginPage({ params }) {
+  const { login, register, isAuthenticated } = useAuth();
+  const { navigate } = useApp2();
+  const [mode, setMode] = useState('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      const { next, ...rest } = params || {};
+      navigate(next || 'dashboard', rest);
+    }
+    // eslint-disable-next-line
+  }, [isAuthenticated]);
+
+  async function submit(e) {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      if (mode === 'login') {
+        await login(email, password);
+      } else {
+        await register(email, password, fullName);
+      }
+      // Redirect happens via the effect above once isAuthenticated flips true.
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="mx-auto flex min-h-[70vh] max-w-md flex-col justify-center px-4 py-14 sm:px-6">
+      <div className="rounded-2xl border border-slate-200 bg-white p-8 shadow-card">
+        <div className="mb-6 flex rounded-xl bg-slate-100 p-1">
+          <button onClick={() => setMode('login')} className={cx('flex-1 rounded-lg py-2 text-sm font-semibold transition', mode === 'login' ? 'bg-white text-brand-700 shadow-sm' : 'text-slate-500')}>Connexion</button>
+          <button onClick={() => setMode('register')} className={cx('flex-1 rounded-lg py-2 text-sm font-semibold transition', mode === 'register' ? 'bg-white text-brand-700 shadow-sm' : 'text-slate-500')}>Créer un compte</button>
+        </div>
+
+        <h1 className="text-xl font-extrabold text-slate-900">{mode === 'login' ? 'Connectez-vous' : 'Créez votre compte'}</h1>
+        <p className="mt-1 text-sm text-slate-500">{mode === 'login' ? 'Accédez à vos réservations et à la messagerie.' : "Réservez vos livraisons et suivez-les en temps réel."}</p>
+
+        <form onSubmit={submit} className="mt-6 space-y-4">
+          {mode === 'register' && (
+            <Field label="Nom complet">
+              <input required className={inputClass} value={fullName} onChange={e => setFullName(e.target.value)} placeholder="Ex : Awa Diallo" />
+            </Field>
+          )}
+          <Field label="Email">
+            <input required type="email" className={inputClass} value={email} onChange={e => setEmail(e.target.value)} placeholder="vous@exemple.com" />
+          </Field>
+          <Field label="Mot de passe" hint={mode === 'register' ? '8 caractères minimum' : undefined}>
+            <input required type="password" minLength={mode === 'register' ? 8 : undefined} className={inputClass} value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" />
+          </Field>
+
+          <ErrorBanner message={error} />
+
+          <PrimaryButton type="submit" className="w-full" disabled={loading}>
+            {loading ? 'Un instant…' : mode === 'login' ? 'Se connecter' : 'Créer mon compte'}
+          </PrimaryButton>
+        </form>
       </div>
     </div>
   );
@@ -1236,14 +1354,29 @@ function AddressFields({ title, value, onChange, international }) {
 }
 
 function BookingPage({ params }) {
-  const { getCarrier, createBooking } = useApp();
   const { navigate } = useApp2();
-  const carrier = getCarrier(params.carrierId);
+  const { isAuthenticated, authLoading } = useRequireAuth('booking', { carrierId: params.carrierId });
+  const { authedFetch } = useAuth();
+  const { getCarrierFromCache } = useData();
+
+  const [carrier, setCarrier] = useState(() => getCarrierFromCache(params.carrierId));
+  const [carrierLoading, setCarrierLoading] = useState(!carrier);
+
+  useEffect(() => {
+    if (carrier) { setCarrierLoading(false); return; }
+    let cancelled = false;
+    apiFetch(`/carriers/${params.carrierId}`)
+      .then(c => { if (!cancelled) setCarrier(normalizeCarrier(c)); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setCarrierLoading(false); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, [params.carrierId]);
 
   const [step, setStep] = useState(1);
   const [createdBooking, setCreatedBooking] = useState(null);
   const [form, setForm] = useState({
-    pickup: { address: '', city: carrier ? carrier.city : '', postalCode: '' },
+    pickup: { address: '', city: '', postalCode: '' },
     dropoff: { address: '', city: '', postalCode: '' },
     packageType: 'petit_colis',
     weight: '',
@@ -1255,6 +1388,47 @@ function BookingPage({ params }) {
     acceptTerms: false,
   });
 
+  useEffect(() => {
+    if (carrier && !form.pickup.city) {
+      setForm(f => ({ ...f, pickup: { ...f.pickup, city: carrier.city } }));
+    }
+    // eslint-disable-next-line
+  }, [carrier]);
+
+  const [quote, setQuote] = useState(null);
+  const [quoteLoading, setQuoteLoading] = useState(false);
+  const [quoteError, setQuoteError] = useState('');
+
+  useEffect(() => {
+    if (step !== 4 || !carrier) return;
+    let cancelled = false;
+    setQuoteLoading(true);
+    setQuoteError('');
+    apiFetch('/bookings/quote', {
+      method: 'POST',
+      body: {
+        pickup_city: form.pickup.city,
+        dropoff_city: form.dropoff.city,
+        pickup_address: form.pickup.address,
+        dropoff_address: form.dropoff.address,
+        vehicle: carrier.vehicle,
+        carrier_id: carrier.id,
+        fragile: form.fragile,
+      },
+    })
+      .then(q => { if (!cancelled) setQuote(q); })
+      .catch(err => { if (!cancelled) setQuoteError(err.message); })
+      .finally(() => { if (!cancelled) setQuoteLoading(false); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, [step, carrier, form.pickup.city, form.dropoff.city, form.pickup.address, form.dropoff.address, form.fragile]);
+
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+
+  if (authLoading || !isAuthenticated) return <Spinner label="Vérification de la connexion…" />;
+  if (carrierLoading) return <Spinner label="Chargement du transporteur…" />;
+
   if (!carrier) {
     return (
       <div className="mx-auto max-w-2xl px-4 py-20 text-center">
@@ -1264,8 +1438,6 @@ function BookingPage({ params }) {
     );
   }
 
-  const distanceKm = estimateDistanceKm(form.pickup.city, form.dropoff.city);
-  const price = computePrice(carrier, distanceKm, form.fragile);
   const isInternational = carrier.vehicle === 'avion' || carrier.vehicle === 'bateau';
 
   function isStepValid(s) {
@@ -1275,11 +1447,37 @@ function BookingPage({ params }) {
     return true;
   }
 
-  function confirmBooking() {
-    const booking = createBooking(carrier.id, form);
-    setCreatedBooking(booking);
-    setStep(5);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+  async function confirmBooking() {
+    setSubmitting(true);
+    setSubmitError('');
+    try {
+      const booking = await authedFetch('/bookings', {
+        method: 'POST',
+        body: {
+          carrier_id: carrier.id,
+          pickup_address: form.pickup.address,
+          pickup_city: form.pickup.city,
+          pickup_postal_code: form.pickup.postalCode || null,
+          dropoff_address: form.dropoff.address,
+          dropoff_city: form.dropoff.city,
+          dropoff_postal_code: form.dropoff.postalCode || null,
+          package_type: form.packageType,
+          weight_kg: Number(form.weight),
+          dimensions: form.dimensions || null,
+          description: form.description || null,
+          fragile: form.fragile,
+          requested_date: form.date,
+          time_window: form.timeWindow,
+        },
+      });
+      setCreatedBooking(normalizeBooking(booking));
+      setStep(5);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (err) {
+      setSubmitError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   if (step === 5 && createdBooking) {
@@ -1294,16 +1492,16 @@ function BookingPage({ params }) {
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Référence de réservation</p>
             <p className="mt-1 font-mono text-xl font-extrabold text-brand-700">{createdBooking.ref}</p>
             <div className="mt-4 grid gap-2 text-sm text-slate-600 sm:grid-cols-2">
-              <p><strong className="text-slate-800">Trajet :</strong> {form.pickup.city} → {form.dropoff.city}</p>
-              <p><strong className="text-slate-800">Date :</strong> {formatDateLong(form.date)}</p>
-              <p><strong className="text-slate-800">Créneau :</strong> {form.timeWindow}</p>
-              <p><strong className="text-slate-800">Prix estimé :</strong> {euros(price)}</p>
+              <p><strong className="text-slate-800">Trajet :</strong> {createdBooking.pickup.city} → {createdBooking.dropoff.city}</p>
+              <p><strong className="text-slate-800">Date :</strong> {formatDateLong(createdBooking.date)}</p>
+              <p><strong className="text-slate-800">Créneau :</strong> {createdBooking.timeWindow}</p>
+              <p><strong className="text-slate-800">Prix :</strong> {euros(createdBooking.price)}</p>
               {carrier.deliveryEstimate && <p className="sm:col-span-2"><strong className="text-slate-800">Délai de livraison estimé :</strong> {carrier.deliveryEstimate}</p>}
             </div>
           </div>
 
           <div className="mt-6 flex flex-col gap-2.5">
-            <PrimaryButton onClick={() => navigate('tracking', { bookingId: createdBooking.id })}>📍 Voir le suivi de ma livraison</PrimaryButton>
+            <PrimaryButton onClick={() => navigate('tracking', { bookingId: createdBooking.id })}>📍 Voir le suivi & payer</PrimaryButton>
             <SecondaryButton onClick={() => navigate('messaging', { carrierId: carrier.id })}>💬 Envoyer un message au transporteur</SecondaryButton>
             <button onClick={() => navigate('dashboard')} className="mt-1 text-sm font-semibold text-slate-500 hover:text-brand-700">Aller à mon tableau de bord →</button>
           </div>
@@ -1402,20 +1600,28 @@ function BookingPage({ params }) {
                 <div className="flex justify-between"><dt className="text-slate-500">Arrivée</dt><dd className="text-right text-slate-800">{form.dropoff.address}, {form.dropoff.city}</dd></div>
                 <div className="flex justify-between"><dt className="text-slate-500">Colis</dt><dd className="text-right text-slate-800">{PACKAGE_TYPES[form.packageType].label} · {form.weight || '—'} kg</dd></div>
                 <div className="flex justify-between"><dt className="text-slate-500">{isInternational ? 'Dépôt' : 'Date'}</dt><dd className="text-right text-slate-800">{formatDateLong(form.date)} · {form.timeWindow}</dd></div>
-                <div className="flex justify-between"><dt className="text-slate-500">Distance estimée</dt><dd className="text-right text-slate-800">{distanceKm} km</dd></div>
+                {quote && <div className="flex justify-between"><dt className="text-slate-500">Distance estimée</dt><dd className="text-right text-slate-800">{quote.distance_km} km</dd></div>}
                 {carrier.deliveryEstimate && <div className="flex justify-between"><dt className="text-slate-500">Délai de livraison</dt><dd className="text-right text-slate-800">{carrier.deliveryEstimate}</dd></div>}
               </dl>
               <div className="mt-4 border-t border-slate-200 pt-3">
-                <table className="w-full text-sm">
-                  <tbody>
-                    <tr><td className="py-1 text-slate-500">Forfait de base</td><td className="py-1 text-right text-slate-700">{euros(carrier.basePrice)}</td></tr>
-                    <tr><td className="py-1 text-slate-500">Distance ({distanceKm} km × {carrier.pricePerKm.toFixed(2)} €)</td><td className="py-1 text-right text-slate-700">{euros(Math.round(distanceKm * carrier.pricePerKm * 100) / 100)}</td></tr>
-                    {form.fragile && <tr><td className="py-1 text-slate-500">Supplément fragile</td><td className="py-1 text-right text-slate-700">{euros(8)}</td></tr>}
-                    <tr className="border-t border-slate-200"><td className="pt-2 font-bold text-slate-900">Total estimé</td><td className="pt-2 text-right text-lg font-extrabold text-brand-700">{euros(price)}</td></tr>
-                  </tbody>
-                </table>
+                {quoteLoading ? (
+                  <p className="py-3 text-center text-sm text-slate-400">Calcul du prix en cours…</p>
+                ) : quoteError ? (
+                  <p className="py-3 text-center text-sm text-rose-600">{quoteError}</p>
+                ) : quote ? (
+                  <table className="w-full text-sm">
+                    <tbody>
+                      <tr><td className="py-1 text-slate-500">Forfait de base</td><td className="py-1 text-right text-slate-700">{euros(quote.base_price)}</td></tr>
+                      <tr><td className="py-1 text-slate-500">Distance ({quote.distance_km} km)</td><td className="py-1 text-right text-slate-700">{euros(quote.distance_price)}</td></tr>
+                      {form.fragile && <tr><td className="py-1 text-slate-500">Supplément fragile</td><td className="py-1 text-right text-slate-700">{euros(quote.fragile_surcharge)}</td></tr>}
+                      <tr className="border-t border-slate-200"><td className="pt-2 font-bold text-slate-900">Total estimé</td><td className="pt-2 text-right text-lg font-extrabold text-brand-700">{euros(quote.total_price)}</td></tr>
+                    </tbody>
+                  </table>
+                ) : null}
               </div>
             </div>
+
+            <ErrorBanner message={submitError} />
 
             <label className="flex items-start gap-2.5">
               <input type="checkbox" checked={form.acceptTerms} onChange={e => setForm(f => ({ ...f, acceptTerms: e.target.checked }))}
@@ -1430,7 +1636,7 @@ function BookingPage({ params }) {
           {step < 4 ? (
             <PrimaryButton onClick={() => setStep(s => s + 1)} disabled={!isStepValid(step)}>Continuer →</PrimaryButton>
           ) : (
-            <PrimaryButton onClick={confirmBooking} disabled={!form.acceptTerms}>✅ Confirmer la demande</PrimaryButton>
+            <PrimaryButton onClick={confirmBooking} disabled={!form.acceptTerms || submitting}>{submitting ? 'Envoi en cours…' : '✅ Confirmer la demande'}</PrimaryButton>
           )}
         </div>
       </div>
@@ -1443,15 +1649,33 @@ function BookingPage({ params }) {
    ====================================================================== */
 
 function DashboardPage() {
-  const { bookings, getCarrier } = useApp();
+  const { isAuthenticated, authLoading } = useRequireAuth('dashboard');
+  const { authedFetch } = useAuth();
   const { navigate } = useApp2();
+  const { getCarrierFromCache } = useData();
+  const [bookings, setBookings] = useState(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (authLoading || !isAuthenticated) return;
+    let cancelled = false;
+    authedFetch('/bookings/mine')
+      .then(list => { if (!cancelled) setBookings(list.map(normalizeBooking)); })
+      .catch(err => { if (!cancelled) setError(err.message); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, [authLoading, isAuthenticated]);
+
+  if (authLoading || !isAuthenticated) return <Spinner label="Vérification de la connexion…" />;
 
   return (
     <div className="mx-auto max-w-5xl px-4 py-8 sm:px-6 lg:px-8">
       <h1 className="text-2xl font-extrabold text-slate-900">Mon tableau de bord</h1>
       <p className="mt-1 text-sm text-slate-500">Retrouvez ici l'ensemble de vos demandes de livraison et leur statut.</p>
 
-      {bookings.length === 0 ? (
+      <div className="mt-6"><ErrorBanner message={error} /></div>
+
+      {bookings === null ? <Spinner label="Chargement de vos réservations…" /> : bookings.length === 0 ? (
         <div className="mt-8 rounded-2xl border border-dashed border-slate-300 bg-white p-14 text-center">
           <div className="text-4xl">📭</div>
           <h3 className="mt-3 text-base font-bold text-slate-800">Aucune livraison pour le moment</h3>
@@ -1461,20 +1685,25 @@ function DashboardPage() {
       ) : (
         <div className="mt-6 space-y-4">
           {bookings.map(b => {
-            const carrier = getCarrier(b.carrierId);
+            const carrier = getCarrierFromCache(b.carrierId);
             return (
               <button key={b.id} onClick={() => navigate('tracking', { bookingId: b.id })}
                 className="flex w-full flex-col gap-4 rounded-2xl border border-slate-200 bg-white p-5 text-left shadow-card transition hover:shadow-cardHover sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-center gap-4">
-                  <Avatar name={carrier.name} initials={carrier.initials} size={11} />
+                  <Avatar name={carrier ? carrier.name : '?'} initials={carrier ? carrier.initials : '?'} size={11} />
                   <div>
-                    <p className="text-sm font-bold text-slate-900">{carrier.name}</p>
+                    <p className="text-sm font-bold text-slate-900">{carrier ? carrier.name : 'Transporteur'}</p>
                     <p className="text-xs text-slate-500">{b.pickup.city} → {b.dropoff.city} · réf. {b.ref}</p>
                     <p className="mt-0.5 text-xs text-slate-400">{formatDateLong(b.date)} · {b.timeWindow}</p>
                   </div>
                 </div>
                 <div className="flex items-center justify-between gap-4 sm:flex-col sm:items-end sm:justify-center sm:gap-2">
-                  <StatusBadge status={b.status} />
+                  <div className="flex items-center gap-2">
+                    <StatusBadge status={b.status} />
+                    {b.paymentStatus !== 'paid' && (
+                      <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-700">{PAYMENT_STATUS_LABELS[b.paymentStatus]}</span>
+                    )}
+                  </div>
                   <p className="text-sm font-bold text-slate-800">{euros(b.price)}</p>
                 </div>
               </button>
@@ -1490,13 +1719,13 @@ function DashboardPage() {
    TRACKING PAGE
    ====================================================================== */
 
-function StatusStepper({ booking }) {
-  const currentIdx = STATUS_ORDER.indexOf(booking.status);
+function StatusStepper({ status, events }) {
+  const currentIdx = STATUS_ORDER.indexOf(status);
   return (
     <div className="flex flex-col gap-0 sm:flex-row sm:items-start">
       {STATUS_ORDER.map((s, i) => {
-        const done = i <= currentIdx;
-        const entry = booking.statusHistory.find(h => h.status === s);
+        const done = currentIdx >= 0 && i <= currentIdx;
+        const entry = events.find(h => h.status === s);
         return (
           <React.Fragment key={s}>
             <div className="flex items-center gap-3 sm:flex-1 sm:flex-col sm:items-center sm:text-center">
@@ -1506,7 +1735,7 @@ function StatusStepper({ booking }) {
               </div>
               <div className="sm:mt-2">
                 <p className={cx('text-sm font-bold', done ? 'text-slate-900' : 'text-slate-400')}>{STATUS_LABELS[s]}</p>
-                <p className="text-xs text-slate-400">{entry ? formatDateTime(entry.at) : 'En attente'}</p>
+                <p className="text-xs text-slate-400">{entry ? formatDateTime(entry.created_at) : 'En attente'}</p>
               </div>
             </div>
             {i < STATUS_ORDER.length - 1 && (
@@ -1522,41 +1751,188 @@ function StatusStepper({ booking }) {
   );
 }
 
-function ExternalTrackingCard() {
-  const providers = ['Chronopost', 'Colissimo', 'DHL Express'];
+function ExternalTrackingCard({ booking }) {
   return (
-    <Section title="Connecter un système de tracking externe" subtitle="Concept — synchronisez le statut avec le système du transporteur partenaire (bientôt disponible).">
-      <div className="grid gap-3 sm:grid-cols-3">
-        {providers.map(p => (
-          <div key={p} className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-center">
-            <span className="text-2xl">🔗</span>
-            <p className="text-sm font-semibold text-slate-700">{p}</p>
-            <button disabled title="Bientôt disponible" className="w-full cursor-not-allowed rounded-lg border border-slate-300 bg-white py-1.5 text-xs font-semibold text-slate-400">
-              Connecter
-            </button>
-            <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-slate-500">Bientôt disponible</span>
+    <Section title="Suivi transporteur externe" subtitle="Numéro de suivi enregistré auprès du réseau du transporteur (Chronopost, Colissimo ou DHL selon le partenaire — ou une simulation tant qu'aucune clé API réelle n'est configurée côté serveur).">
+      {booking.externalTrackingNumber ? (
+        <div className="flex items-center gap-3 rounded-xl bg-slate-50 p-4">
+          <span className="text-2xl">🔗</span>
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Numéro de suivi</p>
+            <p className="font-mono text-sm font-bold text-slate-800">{booking.externalTrackingNumber}</p>
           </div>
-        ))}
-      </div>
+        </div>
+      ) : (
+        <p className="text-sm text-slate-400">Ce transporteur n'est pas relié à un réseau externe — le suivi se fait uniquement via LogiConnect.</p>
+      )}
     </Section>
   );
 }
 
-function TrackingPage({ params }) {
-  const { bookings, getCarrier, advanceBookingStatus } = useApp();
-  const { navigate } = useApp2();
-  const booking = bookings.find(b => b.id === params.bookingId);
+function PaymentPanel({ booking, onPaid }) {
+  const { authedFetch } = useAuth();
+  const [clientSecret, setClientSecret] = useState(null);
+  const [publishableKey, setPublishableKey] = useState(null);
+  const [error, setError] = useState('');
+  const [loadingIntent, setLoadingIntent] = useState(false);
+  const [paying, setPaying] = useState(false);
+  const [succeeded, setSucceeded] = useState(booking.paymentStatus === 'paid');
+  const stripeRef = useRef(null);
+  const cardElRef = useRef(null);
+  const cardMountRef = useRef(null);
 
-  if (!booking) {
+  useEffect(() => { setSucceeded(booking.paymentStatus === 'paid'); }, [booking.paymentStatus]);
+
+  async function startPayment() {
+    setLoadingIntent(true);
+    setError('');
+    try {
+      const data = await authedFetch(`/payments/bookings/${booking.id}/intent`, { method: 'POST' });
+      setClientSecret(data.client_secret);
+      setPublishableKey(data.publishable_key);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoadingIntent(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!clientSecret || !publishableKey || !window.Stripe || !cardMountRef.current) return;
+    const stripe = window.Stripe(publishableKey);
+    const elements = stripe.elements();
+    const card = elements.create('card', { style: { base: { fontSize: '14px' } } });
+    card.mount(cardMountRef.current);
+    stripeRef.current = stripe;
+    cardElRef.current = card;
+    return () => card.destroy();
+  }, [clientSecret, publishableKey]);
+
+  async function confirmPayment(e) {
+    e.preventDefault();
+    if (!stripeRef.current || !cardElRef.current) return;
+    setPaying(true);
+    setError('');
+    const result = await stripeRef.current.confirmCardPayment(clientSecret, {
+      payment_method: { card: cardElRef.current },
+    });
+    setPaying(false);
+    if (result.error) {
+      setError(result.error.message);
+    } else if (result.paymentIntent && result.paymentIntent.status === 'succeeded') {
+      setSucceeded(true);
+      if (onPaid) onPaid();
+    }
+  }
+
+  if (succeeded) {
+    return (
+      <div className="flex items-center gap-2 rounded-xl bg-emerald-50 p-4 text-sm font-semibold text-emerald-700">
+        ✅ Paiement confirmé pour cette livraison.
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {!clientSecret ? (
+        <div>
+          <PrimaryButton onClick={startPayment} disabled={loadingIntent}>
+            {loadingIntent ? 'Préparation du paiement…' : `💳 Payer ${euros(booking.price)}`}
+          </PrimaryButton>
+          {error && <p className="mt-2 text-sm text-rose-600">{error}</p>}
+          {!window.Stripe && <p className="mt-2 text-xs text-slate-400">Stripe.js n'a pas pu se charger (bloqueur de script ou hors ligne).</p>}
+        </div>
+      ) : (
+        <form onSubmit={confirmPayment} className="space-y-3">
+          <div ref={cardMountRef} className="rounded-xl border border-slate-300 bg-white p-3.5"></div>
+          <p className="text-xs text-slate-400">Mode test Stripe — carte 4242 4242 4242 4242, date future, CVC quelconque.</p>
+          {error && <p className="text-sm text-rose-600">{error}</p>}
+          <PrimaryButton type="submit" disabled={paying} className="w-full">{paying ? 'Paiement en cours…' : `Confirmer le paiement de ${euros(booking.price)}`}</PrimaryButton>
+        </form>
+      )}
+    </div>
+  );
+}
+
+function TrackingPage({ params }) {
+  const { isAuthenticated, authLoading } = useRequireAuth('tracking', { bookingId: params.bookingId });
+  const { authedFetch, token } = useAuth();
+  const { navigate } = useApp2();
+  const [booking, setBooking] = useState(null);
+  const [carrier, setCarrier] = useState(null);
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [syncing, setSyncing] = useState(false);
+
+  useEffect(() => {
+    if (authLoading || !isAuthenticated) return;
+    let cancelled = false;
+    setLoading(true);
+    setError('');
+    (async () => {
+      try {
+        const b = await authedFetch(`/bookings/${params.bookingId}`);
+        if (cancelled) return;
+        const nb = normalizeBooking(b);
+        setBooking(nb);
+        const [c, evs] = await Promise.all([
+          apiFetch(`/carriers/${nb.carrierId}`),
+          authedFetch(`/tracking/${params.bookingId}`),
+        ]);
+        if (cancelled) return;
+        setCarrier(normalizeCarrier(c));
+        setEvents(evs);
+      } catch (err) {
+        if (!cancelled) setError(err.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, [params.bookingId, authLoading, isAuthenticated]);
+
+  useEffect(() => {
+    if (!token || !isAuthenticated || authLoading) return;
+    const ws = new WebSocket(`${WS_BASE}/ws/tracking/${params.bookingId}?token=${encodeURIComponent(token)}`);
+    ws.onmessage = (evt) => {
+      try {
+        const data = JSON.parse(evt.data);
+        if (data.type === 'tracking_update') {
+          setEvents(prev => [...prev, { id: 'ws-' + data.created_at, status: data.status, note: data.note, created_at: data.created_at, source: 'internal' }]);
+          setBooking(prev => (prev ? { ...prev, status: data.status } : prev));
+        }
+      } catch (e) { /* ignore malformed frames */ }
+    };
+    return () => ws.close();
+  }, [token, params.bookingId, isAuthenticated, authLoading]);
+
+  async function handleSync() {
+    setSyncing(true);
+    try {
+      const evs = await authedFetch(`/tracking/${params.bookingId}/sync`, { method: 'POST' });
+      setEvents(evs);
+      if (evs.length) setBooking(prev => (prev ? { ...prev, status: evs[evs.length - 1].status } : prev));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  if (authLoading || !isAuthenticated || loading) return <Spinner label="Chargement du suivi…" />;
+
+  if (!booking || !carrier) {
     return (
       <div className="mx-auto max-w-2xl px-4 py-20 text-center">
-        <p className="text-lg font-semibold text-slate-700">Livraison introuvable.</p>
+        <p className="text-lg font-semibold text-slate-700">{error || 'Livraison introuvable.'}</p>
         <SecondaryButton className="mt-4" onClick={() => navigate('dashboard')}>Retour au tableau de bord</SecondaryButton>
       </div>
     );
   }
 
-  const carrier = getCarrier(booking.carrierId);
   const isDelivered = booking.status === 'delivered';
 
   return (
@@ -1574,14 +1950,14 @@ function TrackingPage({ params }) {
         </div>
 
         <div className="mt-8">
-          <StatusStepper booking={booking} />
+          <StatusStepper status={booking.status} events={events} />
         </div>
 
         <div className="mt-8 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4">
-          <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Outil de démonstration</p>
-          <p className="mt-1 text-sm text-slate-600">Ce bouton simule la progression réelle de la livraison (dans un produit final, elle serait mise à jour automatiquement par le transporteur).</p>
-          <SecondaryButton className="mt-3" onClick={() => advanceBookingStatus(booking.id)} disabled={isDelivered}>
-            {isDelivered ? '✅ Livraison terminée' : '▶ Simuler : passer à l’étape suivante'}
+          <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Suivi transporteur</p>
+          <p className="mt-1 text-sm text-slate-600">Interroge le réseau du transporteur (simulation accélérée tant qu'aucune clé Chronopost/Colissimo/DHL réelle n'est configurée côté serveur) pour récupérer les derniers événements.</p>
+          <SecondaryButton className="mt-3" onClick={handleSync} disabled={isDelivered || syncing}>
+            {isDelivered ? '✅ Livraison terminée' : syncing ? 'Vérification…' : '🔄 Vérifier les mises à jour'}
           </SecondaryButton>
         </div>
       </div>
@@ -1610,7 +1986,13 @@ function TrackingPage({ params }) {
       </div>
 
       <div className="mt-6">
-        <ExternalTrackingCard />
+        <Section title="💳 Paiement">
+          <PaymentPanel booking={booking} onPaid={() => setBooking(prev => (prev ? { ...prev, paymentStatus: 'paid' } : prev))} />
+        </Section>
+      </div>
+
+      <div className="mt-6">
+        <ExternalTrackingCard booking={booking} />
       </div>
 
       <div className="mt-6 flex justify-center">
@@ -1625,41 +2007,96 @@ function TrackingPage({ params }) {
    ====================================================================== */
 
 function MessagingPage({ params }) {
-  const { carriers, threads, sendMessage, simulateCarrierReply, typingCarrierId } = useApp();
+  const nextParams = params.carrierId ? { carrierId: params.carrierId } : {};
+  const { isAuthenticated, authLoading } = useRequireAuth('messaging', nextParams);
+  const { authedFetch, token } = useAuth();
   const { navigate } = useApp2();
-  const [activeId, setActiveId] = useState(params.carrierId || null);
+  const { getCarrierFromCache } = useData();
+
+  const [conversations, setConversations] = useState([]);
+  const [messagesByConv, setMessagesByConv] = useState({});
+  const [activeId, setActiveId] = useState(null);
   const [text, setText] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [sending, setSending] = useState(false);
   const scrollRef = useRef(null);
 
+  // Load (or create) the conversation for params.carrierId, plus the full list.
   useEffect(() => {
-    if (params.carrierId) setActiveId(params.carrierId);
-  }, [params.carrierId]);
+    if (authLoading || !isAuthenticated) return;
+    let cancelled = false;
+    setLoading(true);
+    setError('');
+    (async () => {
+      try {
+        let convs = await authedFetch('/messaging/conversations');
+        if (params.carrierId && !convs.some(c => c.carrier_id === params.carrierId)) {
+          const created = await authedFetch(`/messaging/conversations/${params.carrierId}`, { method: 'POST' });
+          convs = [...convs, created];
+        }
+        if (cancelled) return;
+        setConversations(convs);
 
+        const entries = await Promise.all(convs.map(async c => {
+          const msgs = await authedFetch(`/messaging/conversations/${c.id}/messages`);
+          return [c.id, msgs];
+        }));
+        if (cancelled) return;
+        setMessagesByConv(Object.fromEntries(entries));
+
+        const preferred = params.carrierId ? convs.find(c => c.carrier_id === params.carrierId) : null;
+        setActiveId((preferred || convs[0] || {}).id || null);
+      } catch (err) {
+        if (!cancelled) setError(err.message);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, [params.carrierId, authLoading, isAuthenticated]);
+
+  // Live updates for the active conversation only (matches the backend's per-conversation WS room).
   useEffect(() => {
-    if (!activeId) {
-      const withMsgs = carriers.find(c => (threads[c.id] || []).length > 0);
-      setActiveId(withMsgs ? withMsgs.id : carriers[0].id);
-    }
-  }, []);
+    if (!token || !activeId) return;
+    const ws = new WebSocket(`${WS_BASE}/ws/messaging/${activeId}?token=${encodeURIComponent(token)}`);
+    ws.onmessage = (evt) => {
+      try {
+        const data = JSON.parse(evt.data);
+        if (data.type === 'new_message') {
+          setMessagesByConv(prev => {
+            const existing = prev[activeId] || [];
+            if (existing.some(m => m.id === data.id)) return prev;
+            return { ...prev, [activeId]: [...existing, data] };
+          });
+        }
+      } catch (e) { /* ignore malformed frames */ }
+    };
+    return () => ws.close();
+  }, [token, activeId]);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [activeId, threads, typingCarrierId]);
+  }, [activeId, messagesByConv]);
 
-  const active = carriers.find(c => c.id === activeId);
-  const conversations = carriers
-    .map(c => ({ carrier: c, msgs: threads[c.id] || [] }))
-    .sort((a, b) => {
-      const at = a.msgs.length ? new Date(a.msgs[a.msgs.length - 1].time).getTime() : 0;
-      const bt = b.msgs.length ? new Date(b.msgs[b.msgs.length - 1].time).getTime() : 0;
-      return bt - at;
-    });
-
-  function handleSend() {
-    if (!text.trim() || !active) return;
-    sendMessage(active.id, text.trim(), 'client');
+  async function handleSend() {
+    if (!text.trim() || !activeId) return;
+    setSending(true);
+    const value = text.trim();
     setText('');
-    simulateCarrierReply(active.id);
+    try {
+      const msg = await authedFetch(`/messaging/conversations/${activeId}/messages`, { method: 'POST', body: { text: value } });
+      setMessagesByConv(prev => {
+        const existing = prev[activeId] || [];
+        if (existing.some(m => m.id === msg.id)) return prev;
+        return { ...prev, [activeId]: [...existing, msg] };
+      });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSending(false);
+    }
   }
 
   function handleKeyDown(e) {
@@ -1669,28 +2106,51 @@ function MessagingPage({ params }) {
     }
   }
 
-  if (!active) return null;
+  if (authLoading || !isAuthenticated || loading) return <Spinner label="Chargement de la messagerie…" />;
 
-  const activeMsgs = threads[active.id] || [];
+  if (conversations.length === 0) {
+    return (
+      <div className="mx-auto max-w-2xl px-4 py-20 text-center">
+        <p className="text-lg font-semibold text-slate-700">Aucune conversation pour l'instant.</p>
+        <p className="mt-1 text-sm text-slate-500">Contactez un transporteur depuis sa fiche pour démarrer une conversation.</p>
+        <SecondaryButton className="mt-4" onClick={() => navigate('search')}>Trouver un transporteur</SecondaryButton>
+      </div>
+    );
+  }
+
+  const sortedConvs = [...conversations].sort((a, b) => {
+    const am = messagesByConv[a.id] || [];
+    const bm = messagesByConv[b.id] || [];
+    const at = am.length ? parseUTC(am[am.length - 1].created_at).getTime() : 0;
+    const bt = bm.length ? parseUTC(bm[bm.length - 1].created_at).getTime() : 0;
+    return bt - at;
+  });
+
+  const activeConv = conversations.find(c => c.id === activeId);
+  const activeCarrier = activeConv ? getCarrierFromCache(activeConv.carrier_id) : null;
+  const activeMsgs = messagesByConv[activeId] || [];
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6 lg:px-8">
       <h1 className="mb-6 text-2xl font-extrabold text-slate-900">Messagerie</h1>
+      <ErrorBanner message={error} />
       <div className="grid overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-card lg:grid-cols-[300px_1fr]" style={{ minHeight: '560px' }}>
         <div className="border-b border-slate-200 lg:border-b-0 lg:border-r">
           <div className="max-h-[560px] overflow-y-auto msg-scroll">
-            {conversations.map(({ carrier, msgs }) => {
+            {sortedConvs.map(c => {
+              const carrier = getCarrierFromCache(c.carrier_id);
+              const msgs = messagesByConv[c.id] || [];
               const last = msgs[msgs.length - 1];
               return (
-                <button key={carrier.id} onClick={() => setActiveId(carrier.id)}
+                <button key={c.id} onClick={() => setActiveId(c.id)}
                   className={cx('flex w-full items-center gap-3 border-b border-slate-100 p-4 text-left transition hover:bg-slate-50',
-                    activeId === carrier.id && 'bg-brand-50')}>
-                  <Avatar name={carrier.name} initials={carrier.initials} size={10} />
+                    activeId === c.id && 'bg-brand-50')}>
+                  <Avatar name={carrier ? carrier.name : '?'} initials={carrier ? carrier.initials : '?'} size={10} />
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-semibold text-slate-800">{carrier.name}</p>
+                    <p className="truncate text-sm font-semibold text-slate-800">{carrier ? carrier.name : 'Transporteur'}</p>
                     <p className="truncate text-xs text-slate-500">{last ? last.text : 'Aucun message — dites bonjour !'}</p>
                   </div>
-                  {last && <span className="shrink-0 text-[10px] text-slate-400">{formatDateTime(last.time).split(' à ')[0]}</span>}
+                  {last && <span className="shrink-0 text-[10px] text-slate-400">{formatDateTime(last.created_at).split(' à ')[0]}</span>}
                 </button>
               );
             })}
@@ -1698,43 +2158,36 @@ function MessagingPage({ params }) {
         </div>
 
         <div className="flex flex-col">
-          <div className="flex items-center gap-3 border-b border-slate-200 p-4">
-            <Avatar name={active.name} initials={active.initials} size={10} />
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-sm font-bold text-slate-900">{active.name}</p>
-              <p className="text-xs text-slate-500">{active.city} · répond en {active.responseTime}</p>
+          {activeCarrier && (
+            <div className="flex items-center gap-3 border-b border-slate-200 p-4">
+              <Avatar name={activeCarrier.name} initials={activeCarrier.initials} size={10} />
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-bold text-slate-900">{activeCarrier.name}</p>
+                <p className="text-xs text-slate-500">{activeCarrier.city} · répond en {activeCarrier.responseTime}</p>
+              </div>
+              <button onClick={() => navigate('carrier', { id: activeCarrier.id })} className="shrink-0 text-xs font-semibold text-brand-700 hover:underline">Voir le profil</button>
             </div>
-            <button onClick={() => navigate('carrier', { id: active.id })} className="shrink-0 text-xs font-semibold text-brand-700 hover:underline">Voir le profil</button>
-          </div>
+          )}
 
           <div ref={scrollRef} className="msg-scroll flex-1 space-y-3 overflow-y-auto bg-slate-50 p-4" style={{ maxHeight: '420px' }}>
             {activeMsgs.length === 0 && (
-              <p className="py-10 text-center text-sm text-slate-400">Aucun message pour l'instant. Envoyez le premier message à {active.name} !</p>
+              <p className="py-10 text-center text-sm text-slate-400">Aucun message pour l'instant. Envoyez le premier message{activeCarrier ? ` à ${activeCarrier.name}` : ''} !</p>
             )}
             {activeMsgs.map(m => (
-              <div key={m.id} className={cx('flex', m.sender === 'client' ? 'justify-end' : 'justify-start')}>
+              <div key={m.id} className={cx('flex', m.sender_role === 'client' ? 'justify-end' : 'justify-start')}>
                 <div className={cx('max-w-[75%] rounded-2xl px-4 py-2.5 text-sm shadow-sm',
-                  m.sender === 'client' ? 'rounded-br-sm bg-brand-600 text-white' : 'rounded-bl-sm bg-white text-slate-700')}>
+                  m.sender_role === 'client' ? 'rounded-br-sm bg-brand-600 text-white' : 'rounded-bl-sm bg-white text-slate-700')}>
                   <p>{m.text}</p>
-                  <p className={cx('mt-1 text-[10px]', m.sender === 'client' ? 'text-brand-100' : 'text-slate-400')}>{formatDateTime(m.time)}</p>
+                  <p className={cx('mt-1 text-[10px]', m.sender_role === 'client' ? 'text-brand-100' : 'text-slate-400')}>{formatDateTime(m.created_at)}</p>
                 </div>
               </div>
             ))}
-            {typingCarrierId === active.id && (
-              <div className="flex justify-start">
-                <div className="flex items-center gap-1 rounded-2xl rounded-bl-sm bg-white px-4 py-3 shadow-sm">
-                  <span className="typing-dot h-1.5 w-1.5 rounded-full bg-slate-400" style={{ animationDelay: '0ms' }}></span>
-                  <span className="typing-dot h-1.5 w-1.5 rounded-full bg-slate-400" style={{ animationDelay: '150ms' }}></span>
-                  <span className="typing-dot h-1.5 w-1.5 rounded-full bg-slate-400" style={{ animationDelay: '300ms' }}></span>
-                </div>
-              </div>
-            )}
           </div>
 
           <div className="flex items-end gap-2 border-t border-slate-200 p-3">
             <textarea rows="1" value={text} onChange={e => setText(e.target.value)} onKeyDown={handleKeyDown}
               placeholder="Écrivez votre message…" className={cx(inputClass, 'resize-none')}></textarea>
-            <PrimaryButton onClick={handleSend} className="!px-4 !py-2.5" disabled={!text.trim()}>Envoyer</PrimaryButton>
+            <PrimaryButton onClick={handleSend} className="!px-4 !py-2.5" disabled={!text.trim() || sending}>{sending ? '…' : 'Envoyer'}</PrimaryButton>
           </div>
         </div>
       </div>
@@ -1755,6 +2208,7 @@ function Screen({ nav }) {
     case 'search': return <SearchPage params={nav.params} />;
     case 'carrier': return <CarrierDetailPage params={nav.params} />;
     case 'booking': return <BookingPage params={nav.params} />;
+    case 'login': return <LoginPage params={nav.params} />;
     case 'dashboard': return <DashboardPage />;
     case 'tracking': return <TrackingPage params={nav.params} />;
     case 'messaging': return <MessagingPage params={nav.params} />;
@@ -1762,7 +2216,12 @@ function Screen({ nav }) {
   }
 }
 
-function App() {
+function GlobalCityDatalist() {
+  const { cityList } = useData();
+  return <datalist id="city-list">{cityList.map(c => <option key={c} value={c} />)}</datalist>;
+}
+
+function AppShell() {
   const [nav, setNav] = useState(parseHash());
 
   useEffect(() => {
@@ -1780,16 +2239,25 @@ function App() {
 
   return (
     <Nav2Context.Provider value={{ nav, navigate }}>
-      <AppProvider>
-        <div className="flex min-h-screen flex-col">
-          <NavBar />
-          <main className="flex-1">
-            <Screen nav={nav} />
-          </main>
-          <Footer />
-        </div>
-      </AppProvider>
+      <div className="flex min-h-screen flex-col">
+        <NavBar />
+        <main className="flex-1">
+          <Screen nav={nav} />
+        </main>
+        <Footer />
+      </div>
+      <GlobalCityDatalist />
     </Nav2Context.Provider>
+  );
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <DataProvider>
+        <AppShell />
+      </DataProvider>
+    </AuthProvider>
   );
 }
 

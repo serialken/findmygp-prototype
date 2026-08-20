@@ -176,6 +176,8 @@ class DistanceQuery(BaseModel):
     pickup_address: Optional[str] = None
     dropoff_address: Optional[str] = None
     vehicle: str = "voiture"
+    carrier_id: Optional[str] = None
+    fragile: bool = False
 
 
 class DistanceOut(BaseModel):

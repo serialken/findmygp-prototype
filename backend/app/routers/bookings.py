@@ -37,23 +37,35 @@ async def _get_carrier_or_404(db: AsyncSession, carrier_id: str) -> CarrierProfi
 
 
 @router.post("/quote", response_model=BookingQuote)
-async def quote_booking(payload: DistanceQuery):
-    """Public price preview — same pricing logic as booking creation, but
-    read-only, so the frontend can show a live estimate before the user logs in.
-    Distance-only (no carrier_id) since the caller may not have picked a carrier yet."""
+async def quote_booking(payload: DistanceQuery, db: AsyncSession = Depends(get_db)):
+    """Public price preview — read-only, uses the exact same pricing formula
+    as booking creation so the number shown before submitting always matches
+    what POST /bookings will actually charge. Pass carrier_id for a real
+    per-carrier price using that carrier's rates and vehicle (falls back to a
+    generic distance-only estimate if no carrier is picked yet)."""
+    vehicle = payload.vehicle
+    base_price = 0.0
+    price_per_km = 1.0
+
+    if payload.carrier_id:
+        carrier = await _get_carrier_or_404(db, payload.carrier_id)
+        vehicle = carrier.vehicle.value
+        base_price = carrier.base_price
+        price_per_km = carrier.price_per_km
+
     distance = await geocoding_service.estimate_distance_km(
         payload.pickup_address or payload.pickup_city,
         payload.dropoff_address or payload.dropoff_city,
-        payload.vehicle,
+        vehicle,
     )
-    priced = pricing_service.compute_price(0.0, 1.0, distance["distance_km"], False)
+    priced = pricing_service.compute_price(base_price, price_per_km, distance["distance_km"], payload.fragile)
     return BookingQuote(
         distance_km=distance["distance_km"],
         distance_source=distance["source"],
-        base_price=0.0,
+        base_price=priced["base_price"],
         distance_price=priced["distance_price"],
-        fragile_surcharge=0.0,
-        total_price=priced["distance_price"],
+        fragile_surcharge=priced["fragile_surcharge"],
+        total_price=priced["total_price"],
     )
 
 
