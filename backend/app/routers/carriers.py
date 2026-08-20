@@ -84,3 +84,31 @@ async def link_carrier_account(
     await db.commit()
     await db.refresh(carrier)
     return carrier
+
+
+@router.delete("/{carrier_id}/link-account", response_model=CarrierOut)
+async def unlink_carrier_account(
+    carrier_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Unlinks a carrier profile from its account — only the linked account
+    itself or an admin can do this. Idempotent: unlinking an already-unclaimed
+    profile is a no-op, not an error."""
+    result = await db.execute(select(CarrierProfile).where(CarrierProfile.id == carrier_id))
+    carrier = result.scalar_one_or_none()
+    if not carrier:
+        raise HTTPException(status_code=404, detail="Transporteur introuvable")
+
+    if carrier.user_id is None:
+        return carrier
+
+    if carrier.user_id != current_user.id and current_user.role.value != "admin":
+        raise HTTPException(
+            status_code=403, detail="Seul le compte lié (ou un administrateur) peut délier ce profil"
+        )
+
+    carrier.user_id = None
+    await db.commit()
+    await db.refresh(carrier)
+    return carrier
