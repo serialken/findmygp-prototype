@@ -20,11 +20,16 @@ def _require_configured():
 def create_payment_intent(amount_eur: float, booking_ref: str, currency: str = "eur") -> stripe.PaymentIntent:
     _require_configured()
     amount_cents = round(amount_eur * 100)
+    # payment_method_types=["card"], not automatic_payment_methods: the frontend
+    # uses the classic Card Element + confirmCardPayment(), not the newer Payment
+    # Element. automatic_payment_methods opts into dashboard-configured methods
+    # that can include redirect-based ones, which require a return_url and don't
+    # pair cleanly with confirmCardPayment.
     return stripe.PaymentIntent.create(
         amount=amount_cents,
         currency=currency,
         metadata={"booking_ref": booking_ref},
-        automatic_payment_methods={"enabled": True},
+        payment_method_types=["card"],
     )
 
 

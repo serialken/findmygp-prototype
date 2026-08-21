@@ -1823,6 +1823,10 @@ function PaymentPanel({ booking, onPaid }) {
     } else if (result.paymentIntent && result.paymentIntent.status === 'succeeded') {
       setSucceeded(true);
       if (onPaid) onPaid();
+      // Stripe's webhook is what normally flips the booking to "paid" server-side,
+      // but it can't reach a local/dev API — so also confirm synchronously here.
+      // The endpoint re-verifies with Stripe itself, it doesn't just trust this call.
+      authedFetch(`/payments/bookings/${booking.id}/confirm`, { method: 'POST' }).catch(() => {});
     }
   }
 
