@@ -101,5 +101,7 @@ The `Dockerfile` + `docker-compose.yml` are deploy-ready for Railway, Render, or
 Fly.io — point any of them at this `backend/` directory, set the same env vars
 from `.env.example` in their dashboard, and provision a managed Postgres
 (or use the `db` service for smaller deployments). The API binds to
-`0.0.0.0:8000` and reads `DATABASE_URL` from the environment, which is the
-standard contract all three platforms expect.
+`0.0.0.0:$PORT` (falling back to `8000` locally) and reads `DATABASE_URL` from
+the environment. Binding to `$PORT` rather than a hardcoded port is required by
+Railway and Render, which inject their own `PORT` value at runtime and route
+traffic to it.
