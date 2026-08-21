@@ -14,8 +14,10 @@ messaging, and Stripe payments all talk to a running FastAPI + PostgreSQL backen
 
 ```
 .
-├── index.html      Frontend — single-file React app (CDN React + Babel, no build step)
-└── backend/        FastAPI + PostgreSQL API (auth, bookings, tracking, messaging, payments)
+├── index.html          Frontend — single-file React app (CDN React + Babel, no build step)
+├── .env.example        Reference copy of every env var — see its header for why it's not the one you actually edit
+└── backend/            FastAPI + PostgreSQL API (auth, bookings, tracking, messaging, payments)
+    └── .env.example    The real one — copy this to backend/.env
 ```
 
 ## Quick start
