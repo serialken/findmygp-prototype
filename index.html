@@ -233,9 +233,10 @@ function buildHash(screen, params) {
    API CLIENT
    ====================================================================== */
 
-// Backend API base URL. Change this when deploying (e.g. to your API's
-// production URL) — everything else in this file reads from this constant.
-const API_BASE = 'http://localhost:8001';
+// Backend API base URL. Matches the backend's default uvicorn port (see
+// backend/README.md). Change this when deploying, or if you run the API on
+// a different port locally — everything else in this file reads from this constant.
+const API_BASE = 'http://localhost:8000';
 const WS_BASE = API_BASE.replace(/^http/, 'ws');
 
 class ApiError extends Error {
