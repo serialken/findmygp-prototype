@@ -54,6 +54,22 @@
 <!-- Stripe.js (only used once a real Stripe key is returned by the API) -->
 <script src="https://js.stripe.com/v3/"></script>
 
+<!-- PostHog product analytics — colle ta Project API Key ci-dessous une fois ton
+     compte créé sur posthog.com (Project Settings → Project API Key, commence par
+     "phc_"). Tant que POSTHOG_KEY est vide, posthog.init() n'est jamais appelé : les
+     appels posthog.capture(...) plus bas dans l'app restent des no-op silencieux,
+     rien n'est envoyé et aucune erreur ne se produit. -->
+<script>
+  window.POSTHOG_KEY = ''; // ex: 'phc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+  window.POSTHOG_HOST = 'https://eu.i.posthog.com'; // ou 'https://us.i.posthog.com' — utilise la région choisie à la création du compte
+</script>
+<script>
+  !function(t,e){var o,n,p,r;e.__SV||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+".people (stub)"},o="init capture register register_once register_for_session unregister unregister_for_session getFeatureFlag getFeatureFlagResult isFeatureEnabled reloadFeatureFlags updateEarlyAccessFeatureEnrollment getEarlyAccessFeatures on onFeatureFlags onSessionId getSurveys getActiveMatchingSurveys renderSurvey canRenderSurvey getNextSurveyStep identify setPersonProperties group resetGroups setPersonPropertiesForFlags resetPersonPropertiesForFlags setGroupPropertiesForFlags resetGroupPropertiesForFlags reset get_distinct_id getGroups get_session_id get_session_replay_url alias set_config startSessionRecording stopSessionRecording sessionRecordingStarted captureException loadToolbar get_property getSessionProperty createPersonProfile opt_in_capturing opt_out_capturing has_opted_in_capturing has_opted_out_capturing clear_opt_in_out_capturing debug".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])},e.__SV=1)}(document,window.posthog||[]);
+  if (window.POSTHOG_KEY) {
+    posthog.init(window.POSTHOG_KEY, { api_host: window.POSTHOG_HOST, defaults: '2026-05-30' });
+  }
+</script>
+
 <style>
   html { scroll-behavior: smooth; }
   body { font-family: 'Inter', ui-sans-serif, system-ui, sans-serif; background-color: #f6f7fb; }
@@ -366,12 +382,20 @@ function AuthProvider({ children }) {
   async function login(email, password) {
     const data = await apiFetch('/auth/login', { method: 'POST', body: { email, password } });
     persist(data);
+    if (window.posthog) {
+      posthog.identify(data.user.id, { email: data.user.email, full_name: data.user.full_name, role: data.user.role });
+      posthog.capture('beta_login');
+    }
     return data;
   }
 
   async function register(email, password, fullName) {
     const data = await apiFetch('/auth/register', { method: 'POST', body: { email, password, full_name: fullName, role: 'client' } });
     persist(data);
+    if (window.posthog) {
+      posthog.identify(data.user.id, { email: data.user.email, full_name: data.user.full_name, role: data.user.role });
+      posthog.capture('beta_signup');
+    }
     return data;
   }
 
@@ -974,7 +998,13 @@ function SearchPage({ params }) {
       if (filters.vehicle !== 'all') qs.set('vehicle', filters.vehicle);
       qs.set('max_price', String(filters.maxPrice));
       apiFetch(`/carriers?${qs.toString()}`)
-        .then(list => { if (!cancelled) setServerResults(list.map(normalizeCarrier)); })
+        .then(list => {
+          if (cancelled) return;
+          setServerResults(list.map(normalizeCarrier));
+          if (window.posthog) {
+            posthog.capture('carrier_search', { results_count: list.length, pickup_city: filters.pickupCity || null, dropoff_city: filters.dropoffCity || null });
+          }
+        })
         .catch(err => { if (!cancelled) setError(err.message); })
         .finally(() => { if (!cancelled) setLoading(false); });
     }, 300);
@@ -1091,7 +1121,11 @@ function CarrierDetailPage({ params }) {
     setLoading(true);
     setError('');
     apiFetch(`/carriers/${params.id}`)
-      .then(c => { if (!cancelled) setCarrier(normalizeCarrier(c)); })
+      .then(c => {
+        if (cancelled) return;
+        setCarrier(normalizeCarrier(c));
+        if (window.posthog) posthog.capture('carrier_profile_viewed', { carrier_id: params.id });
+      })
       .catch(err => { if (!cancelled) setError(err.message); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
@@ -1474,6 +1508,7 @@ function BookingPage({ params }) {
       setCreatedBooking(normalizeBooking(booking));
       setStep(5);
       window.scrollTo({ top: 0, behavior: 'smooth' });
+      if (window.posthog) posthog.capture('booking_created', { booking_id: booking.id, carrier_id: carrier.id, price: booking.price });
     } catch (err) {
       setSubmitError(err.message);
     } finally {
@@ -1791,6 +1826,7 @@ function PaymentPanel({ booking, onPaid }) {
       const data = await authedFetch(`/payments/bookings/${booking.id}/intent`, { method: 'POST' });
       setClientSecret(data.client_secret);
       setPublishableKey(data.publishable_key);
+      if (window.posthog) posthog.capture('payment_started', { booking_id: booking.id });
     } catch (err) {
       setError(err.message);
     } finally {
@@ -1823,6 +1859,7 @@ function PaymentPanel({ booking, onPaid }) {
     } else if (result.paymentIntent && result.paymentIntent.status === 'succeeded') {
       setSucceeded(true);
       if (onPaid) onPaid();
+      if (window.posthog) posthog.capture('payment_succeeded', { booking_id: booking.id, price: booking.price });
       // Stripe's webhook is what normally flips the booking to "paid" server-side,
       // but it can't reach a local/dev API — so also confirm synchronously here.
       // The endpoint re-verifies with Stripe itself, it doesn't just trust this call.
@@ -1889,6 +1926,7 @@ function TrackingPage({ params }) {
         if (cancelled) return;
         setCarrier(normalizeCarrier(c));
         setEvents(evs);
+        if (window.posthog) posthog.capture('tracking_opened', { booking_id: params.bookingId });
       } catch (err) {
         if (!cancelled) setError(err.message);
       } finally {
@@ -1908,6 +1946,7 @@ function TrackingPage({ params }) {
         if (data.type === 'tracking_update') {
           setEvents(prev => [...prev, { id: 'ws-' + data.created_at, status: data.status, note: data.note, created_at: data.created_at, source: 'internal' }]);
           setBooking(prev => (prev ? { ...prev, status: data.status } : prev));
+          if (window.posthog) posthog.capture('tracking_update_received', { booking_id: params.bookingId, status: data.status });
         }
       } catch (e) { /* ignore malformed frames */ }
     };
